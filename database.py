@@ -68,6 +68,8 @@ class VulnerabilityDB:
               summary TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'new'
                 CHECK(status IN ('new','triaged','fixing','resolved','published','rejected')),
+              withdrawal_state TEXT NOT NULL DEFAULT 'none'
+                CHECK(withdrawal_state IN ('none','pending','withdrawn')),
               confidential_until TEXT NOT NULL,
               public_at TEXT,
               created_at TEXT NOT NULL,
@@ -132,6 +134,19 @@ class VulnerabilityDB:
               message TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS withdrawal_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              reporter_id INTEGER NOT NULL REFERENCES users(id),
+              reason TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','approved','rejected')),
+              coordinator_id INTEGER REFERENCES users(id),
+              decision_note TEXT NOT NULL DEFAULT '',
+              requested_at TEXT NOT NULL,
+              decided_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_pending_withdrawal
+              ON withdrawal_requests(report_id) WHERE state='pending';
             CREATE TABLE IF NOT EXISTS advisory_drafts (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               report_id INTEGER NOT NULL UNIQUE REFERENCES reports(id) ON DELETE CASCADE,
@@ -144,6 +159,52 @@ class VulnerabilityDB:
             """
         )
         self.conn.commit()
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        columns = [row[1] for row in self.conn.execute("PRAGMA table_info(reports)").fetchall()]
+        if columns and "withdrawal_state" not in columns:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                self.conn.execute(
+                    """
+                    CREATE TABLE reports_new (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      public_id TEXT NOT NULL UNIQUE,
+                      title TEXT NOT NULL,
+                      product_id INTEGER NOT NULL REFERENCES products(id),
+                      reporter_id INTEGER NOT NULL REFERENCES users(id),
+                      summary TEXT NOT NULL,
+                      status TEXT NOT NULL DEFAULT 'new'
+                        CHECK(status IN ('new','triaged','fixing','resolved','published','rejected')),
+                      withdrawal_state TEXT NOT NULL DEFAULT 'none'
+                        CHECK(withdrawal_state IN ('none','pending','withdrawn')),
+                      confidential_until TEXT NOT NULL,
+                      public_at TEXT,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO reports_new(
+                      id,public_id,title,product_id,reporter_id,summary,status,
+                      withdrawal_state,confidential_until,public_at,created_at,updated_at
+                    )
+                    SELECT id,public_id,title,product_id,reporter_id,summary,status,
+                      'none',confidential_until,public_at,created_at,updated_at FROM reports
+                    """
+                )
+                self.conn.execute("DROP TABLE reports")
+                self.conn.execute("ALTER TABLE reports_new RENAME TO reports")
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            finally:
+                self.conn.execute("PRAGMA foreign_keys=ON")
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -186,12 +247,22 @@ class VulnerabilityDB:
 
     def find_duplicate_reports(self, product_id: int, version_key: str) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT r.id,r.public_id,r.title,r.status,v.version_key FROM reports r "
+            "SELECT r.id,r.public_id,r.title,r.status,r.withdrawal_state,v.version_key FROM reports r "
             "JOIN affected_versions v ON v.report_id=r.id "
             "WHERE r.product_id=? AND v.version_key=? AND r.status NOT IN ('published','rejected') ORDER BY r.id",
             (product_id, version_key.strip()),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def _editable_report(self, report_id: int) -> sqlite3.Row:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        if report["withdrawal_state"] == "pending":
+            raise DomainError("撤回申请处理中，报告已冻结")
+        if report["withdrawal_state"] == "withdrawn":
+            raise DomainError("报告已撤回，不能继续修改")
+        return report
 
     def create_report(self, title: str, product_id: int, reporter_id: int, summary: str,
                       confidential_until: str, versions: list[str], version_details: str = "",
@@ -237,9 +308,7 @@ class VulnerabilityDB:
         return report_id
 
     def add_member(self, report_id: int, user_id: int, member_role: str, added_by: int) -> None:
-        actor, user, report = self._user(added_by), self._user(user_id), self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
-        if not report:
-            raise DomainError("报告不存在")
+        actor, user, report = self._user(added_by), self._user(user_id), self._editable_report(report_id)
         if actor["role"] != "coordinator" or member_role not in {"coordinator", "maintainer"}:
             raise DomainError("只有协调员可以添加协调员或维护者")
         if member_role == "maintainer" and user["role"] != "maintainer":
@@ -266,6 +335,7 @@ class VulnerabilityDB:
     def add_evidence(self, report_id: int, name: str, content: str, classification: str, uploaded_by: int) -> int:
         if not self.can_view(report_id, uploaded_by):
             raise DomainError("无权向该报告添加材料")
+        self._editable_report(report_id)
         if classification not in {"private", "coordinator"} or not name.strip() or not content:
             raise DomainError("材料名称、内容或密级无效")
         user = self._user(uploaded_by)
@@ -304,13 +374,102 @@ class VulnerabilityDB:
         payload["evidence"] = evidence
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
+        payload["withdrawals"] = [dict(r) for r in self.conn.execute(
+            "SELECT w.*,reporter.name AS reporter_name,coordinator.name AS coordinator_name "
+            "FROM withdrawal_requests w "
+            "JOIN users reporter ON reporter.id=w.reporter_id "
+            "LEFT JOIN users coordinator ON coordinator.id=w.coordinator_id "
+            "WHERE w.report_id=? ORDER BY w.id",
+            (report_id,),
+        )]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
         return payload
+
+    def request_withdrawal(self, report_id: int, reporter_id: int, reason: str) -> int:
+        reporter = self._user(reporter_id)
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        if reporter["role"] != "reporter" or reporter_id != report["reporter_id"]:
+            raise DomainError("只有报告人可以申请撤回自己的报告")
+        if not reason.strip():
+            raise DomainError("撤回原因不能为空")
+        if report["withdrawal_state"] == "pending":
+            raise DomainError("该报告已有撤回申请等待处理")
+        if report["withdrawal_state"] == "withdrawn":
+            raise DomainError("该报告已经撤回")
+        if report["status"] in {"published", "rejected"}:
+            raise DomainError("已公开或已驳回的报告不能申请撤回")
+        now = datetime.now().isoformat()
+        try:
+            with self.transaction():
+                cur = self.conn.execute(
+                    "INSERT INTO withdrawal_requests(report_id,reporter_id,reason,requested_at) VALUES(?,?,?,?)",
+                    (report_id, reporter_id, reason.strip(), now),
+                )
+                self.conn.execute(
+                    "UPDATE reports SET withdrawal_state='pending',updated_at=? WHERE id=?", (now, report_id)
+                )
+                self.conn.execute(
+                    "INSERT INTO status_history(report_id,old_status,new_status,changed_by,note,created_at) VALUES(?,?,?,?,?,?)",
+                    (report_id, report["status"], "withdrawal_pending", reporter_id, f"申请撤回: {reason.strip()}", now),
+                )
+                for coordinator in self.conn.execute("SELECT id FROM users WHERE role='coordinator'").fetchall():
+                    self._notify(report_id, coordinator["id"], "withdrawal", "有报告撤回申请待处理")
+        except sqlite3.IntegrityError as exc:
+            raise DomainError("该报告已有撤回申请等待处理") from exc
+        return int(cur.lastrowid)
+
+    def decide_withdrawal(self, report_id: int, coordinator_id: int, approved: bool, note: str = "") -> None:
+        coordinator = self._user(coordinator_id)
+        if coordinator["role"] != "coordinator":
+            raise DomainError("只有协调员可以处理撤回申请")
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        request = self.conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE report_id=? AND state='pending' ORDER BY id DESC LIMIT 1",
+            (report_id,),
+        ).fetchone()
+        if not request:
+            raise DomainError("该报告没有待处理的撤回申请")
+        state = "approved" if approved else "rejected"
+        new_status = "withdrawn" if approved else report["status"]
+        result_text = "同意撤回" if approved else "驳回撤回申请"
+        message = f"撤回申请已{result_text}"
+        now = datetime.now().isoformat()
+        with self.transaction():
+            updated = self.conn.execute(
+                "UPDATE withdrawal_requests SET state=?,coordinator_id=?,decision_note=?,decided_at=? "
+                "WHERE id=? AND state='pending'",
+                (state, coordinator_id, note.strip(), now, request["id"]),
+            ).rowcount
+            if updated != 1:
+                raise DomainError("该报告没有待处理的撤回申请")
+            self.conn.execute(
+                "UPDATE reports SET withdrawal_state=?,updated_at=? WHERE id=?",
+                ("withdrawn" if approved else "none", now, report_id),
+            )
+            history_note = f"{result_text}: {note.strip()}" if note.strip() else result_text
+            self.conn.execute(
+                "INSERT INTO status_history(report_id,old_status,new_status,changed_by,note,created_at) VALUES(?,?,?,?,?,?)",
+                (report_id, "withdrawal_pending", new_status, coordinator_id, history_note, now),
+            )
+            recipients = {report["reporter_id"]}
+            recipients.update(row["user_id"] for row in self.conn.execute(
+                "SELECT user_id FROM report_members WHERE report_id=?", (report_id,)
+            ).fetchall())
+            recipients.update(row["id"] for row in self.conn.execute(
+                "SELECT id FROM users WHERE role='coordinator'"
+            ).fetchall())
+            recipients.discard(coordinator_id)
+            for user_id in recipients:
+                self._notify(report_id, user_id, "withdrawal", message)
 
     def set_status(self, report_id: int, new_status: str, user_id: int, note: str = "") -> None:
         if not self.can_view(report_id, user_id):
             raise DomainError("无权修改该报告")
-        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        report = self._editable_report(report_id)
         user = self._user(user_id)
         if user["role"] == "reporter" and new_status != "rejected":
             raise DomainError("报告人不能推进协调状态")
@@ -332,6 +491,7 @@ class VulnerabilityDB:
         user = self._user(maintainer_id)
         if user["role"] != "maintainer" or not self._member(report_id, maintainer_id):
             raise DomainError("只有该报告的维护者可以提交修复计划")
+        self._editable_report(report_id)
         if user["role"] == "maintainer" and not self.can_view(report_id, maintainer_id):
             raise DomainError("无权修改该报告")
         if not plan.strip():
@@ -359,8 +519,8 @@ class VulnerabilityDB:
 
     def extend_embargo(self, report_id: int, new_deadline: str, reason: str, coordinator_id: int) -> int:
         actor = self._user(coordinator_id)
-        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
-        if not report or actor["role"] != "coordinator":
+        report = self._editable_report(report_id)
+        if actor["role"] != "coordinator":
             raise DomainError("只有协调员可以延期")
         try:
             new_date = datetime.strptime(new_deadline, "%Y-%m-%d").date()
@@ -389,7 +549,7 @@ class VulnerabilityDB:
         user = self._user(user_id)
         if user["role"] not in {"coordinator", "maintainer"}:
             raise DomainError("只有协调员或维护者可以创建公告草稿")
-        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        report = self._editable_report(report_id)
         if report["status"] not in {"fixing", "resolved"}:
             raise DomainError("只有修复中或已解决报告可以创建公告")
         if len(content.strip()) < 10:
@@ -423,9 +583,9 @@ class VulnerabilityDB:
 
     def publish_report(self, report_id: int, coordinator_id: int, as_of: str | None = None) -> None:
         actor = self._user(coordinator_id)
-        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
-        if not report or actor["role"] != "coordinator":
+        if actor["role"] != "coordinator":
             raise DomainError("只有协调员可以披露报告")
+        report = self._editable_report(report_id)
         when = as_of or datetime.now().date().isoformat()
         try:
             now_date = datetime.strptime(when, "%Y-%m-%d").date()
@@ -467,11 +627,17 @@ class VulnerabilityDB:
             (user_id,),
         ).fetchall()]
 
-    def snapshot(self) -> dict:
+    def snapshot(self, user_id: int = 0) -> dict:
+        user = self.conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone()
+        reports = []
+        for row in self.conn.execute(
+            "SELECT r.*,p.name AS product_name,u.name AS reporter_name FROM reports r "
+            "JOIN products p ON p.id=r.product_id JOIN users u ON u.id=r.reporter_id ORDER BY r.id"
+        ):
+            if row["status"] == "published" or (user and self.can_view(row["id"], user_id)):
+                reports.append(dict(row))
         return {
             "products": [dict(r) for r in self.conn.execute("SELECT * FROM products ORDER BY id")],
-            "reports": [dict(r) for r in self.conn.execute(
-                "SELECT r.*,p.name AS product_name,u.name AS reporter_name FROM reports r JOIN products p ON p.id=r.product_id JOIN users u ON u.id=r.reporter_id ORDER BY r.id"
-            )],
+            "reports": reports,
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role,organization FROM users ORDER BY id")],
         }
