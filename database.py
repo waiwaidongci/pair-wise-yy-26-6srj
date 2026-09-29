@@ -141,6 +141,20 @@ class VulnerabilityDB:
               created_at TEXT NOT NULL,
               published_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS withdrawal_requests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              requested_by INTEGER NOT NULL REFERENCES users(id),
+              reason TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected')),
+              previous_status TEXT NOT NULL,
+              reviewed_by INTEGER REFERENCES users(id),
+              review_note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              reviewed_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawal_one_pending
+              ON withdrawal_requests(report_id) WHERE status='pending';
             """
         )
         self.conn.commit()
@@ -186,7 +200,10 @@ class VulnerabilityDB:
 
     def find_duplicate_reports(self, product_id: int, version_key: str) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT r.id,r.public_id,r.title,r.status,v.version_key FROM reports r "
+            "SELECT r.id,r.public_id,r.title,r.status,v.version_key,"
+            "(SELECT w.status FROM withdrawal_requests w WHERE w.report_id=r.id "
+            " ORDER BY CASE WHEN w.status='pending' THEN 0 ELSE 1 END, w.id DESC LIMIT 1) AS withdrawal_status "
+            "FROM reports r "
             "JOIN affected_versions v ON v.report_id=r.id "
             "WHERE r.product_id=? AND v.version_key=? AND r.status NOT IN ('published','rejected') ORDER BY r.id",
             (product_id, version_key.strip()),
@@ -211,8 +228,13 @@ class VulnerabilityDB:
         for version in versions:
             duplicates.extend(self.find_duplicate_reports(product_id, version))
         if duplicates and not allow_duplicate:
-            ids = ", ".join(row["public_id"] for row in duplicates)
-            raise DomainError(f"可能重复的报告: {ids}")
+            seen, marks = set(), []
+            for row in duplicates:
+                if row["public_id"] in seen:
+                    continue
+                seen.add(row["public_id"])
+                marks.append(row["public_id"] + ("（已撤回，请核对是否重复）" if row["withdrawal_status"] == "approved" else ""))
+            raise DomainError(f"可能重复的报告: {', '.join(marks)}")
         created = datetime.now().isoformat()
         with self.transaction():
             temp_id = self.conn.execute("SELECT COALESCE(MAX(id),0)+1 FROM reports").fetchone()[0]
@@ -240,6 +262,7 @@ class VulnerabilityDB:
         actor, user, report = self._user(added_by), self._user(user_id), self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         if not report:
             raise DomainError("报告不存在")
+        self._ensure_not_frozen(report_id)
         if actor["role"] != "coordinator" or member_role not in {"coordinator", "maintainer"}:
             raise DomainError("只有协调员可以添加协调员或维护者")
         if member_role == "maintainer" and user["role"] != "maintainer":
@@ -263,9 +286,108 @@ class VulnerabilityDB:
             return True
         return bool(user_id == report["reporter_id"] or self._member(report_id, user_id))
 
+    def _active_withdrawal(self, report_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM withdrawal_requests WHERE report_id=? AND status IN ('pending','approved') "
+            "ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC LIMIT 1",
+            (report_id,),
+        ).fetchone()
+
+    def _ensure_not_frozen(self, report_id: int) -> None:
+        active = self._active_withdrawal(report_id)
+        if not active:
+            return
+        if active["status"] == "pending":
+            raise DomainError("撤回申请处理中，报告暂时冻结")
+        raise DomainError("报告已撤回，不能继续处理")
+
+    def request_withdrawal(self, report_id: int, reporter_id: int, reason: str) -> int:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        actor = self._user(reporter_id)
+        if actor["role"] != "reporter" or report["reporter_id"] != reporter_id:
+            raise DomainError("只有报告本人可以申请撤回")
+        if len(reason.strip()) < 5:
+            raise DomainError("请写明撤回原因（至少5个字符）")
+        if report["status"] in {"published", "rejected"}:
+            raise DomainError("已公开或已驳回的报告不能申请撤回")
+        active = self._active_withdrawal(report_id)
+        if active is not None:
+            raise DomainError("撤回申请处理中，报告已冻结" if active["status"] == "pending" else "该报告已撤回")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO withdrawal_requests(report_id,requested_by,reason,previous_status,created_at) VALUES(?,?,?,?,?)",
+                (report_id, reporter_id, reason.strip(), report["status"], now),
+            )
+            request_id = int(cur.lastrowid)
+            coordinators = self.conn.execute("SELECT id FROM users WHERE role='coordinator'").fetchall()
+            for coordinator in coordinators:
+                self._notify(report_id, coordinator["id"], "withdrawal", f"{report['public_id']} 收到撤回申请，请审核")
+        return request_id
+
+    def review_withdrawal(self, request_id: int, coordinator_id: int, decision: str, note: str = "") -> dict:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以审核撤回申请")
+        if decision not in {"approved", "rejected"}:
+            raise DomainError("审核结果必须是 approved 或 rejected")
+        request = self.conn.execute(
+            "SELECT w.*,r.public_id FROM withdrawal_requests w JOIN reports r ON r.id=w.report_id WHERE w.id=?",
+            (request_id,),
+        ).fetchone()
+        if not request:
+            raise DomainError("撤回申请不存在")
+        if request["status"] != "pending":
+            raise DomainError("该撤回申请已审核")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE withdrawal_requests SET status=?,reviewed_by=?,review_note=?,reviewed_at=? WHERE id=?",
+                (decision, coordinator_id, note.strip(), now, request_id),
+            )
+            recipients = [request["requested_by"]]
+            recipients.extend(row["user_id"] for row in self.conn.execute(
+                "SELECT user_id FROM report_members WHERE report_id=?", (request["report_id"],)
+            ).fetchall())
+            message = (
+                f"撤回申请已同意，{request['public_id']} 保留记录但不再对外公开"
+                if decision == "approved"
+                else f"撤回申请被驳回，{request['public_id']} 恢复为 {request['previous_status']} 处理状态"
+            )
+            for user_id in dict.fromkeys(recipients):
+                self._notify(request["report_id"], user_id, "withdrawal", message)
+        return {"id": request_id, "status": decision}
+
+    def pending_withdrawals(self, coordinator_id: int) -> list[dict]:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以查看撤回审核队列")
+        rows = self.conn.execute(
+            "SELECT w.id,w.report_id,w.reason,w.previous_status,w.created_at,"
+            "r.public_id,r.title,u.name AS requester_name "
+            "FROM withdrawal_requests w "
+            "JOIN reports r ON r.id=w.report_id "
+            "JOIN users u ON u.id=w.requested_by "
+            "WHERE w.status='pending' ORDER BY w.id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _withdrawal_payload(self, report_id: int) -> dict:
+        rows = self.conn.execute(
+            "SELECT w.*,u.name AS requester_name,c.name AS reviewer_name FROM withdrawal_requests w "
+            "JOIN users u ON u.id=w.requested_by LEFT JOIN users c ON c.id=w.reviewed_by "
+            "WHERE w.report_id=? ORDER BY w.id",
+            (report_id,),
+        ).fetchall()
+        requests = [dict(row) for row in rows]
+        return {"requests": requests, "latest": requests[-1] if requests else None}
+
     def add_evidence(self, report_id: int, name: str, content: str, classification: str, uploaded_by: int) -> int:
         if not self.can_view(report_id, uploaded_by):
             raise DomainError("无权向该报告添加材料")
+        self._ensure_not_frozen(report_id)
         if classification not in {"private", "coordinator"} or not name.strip() or not content:
             raise DomainError("材料名称、内容或密级无效")
         user = self._user(uploaded_by)
@@ -305,11 +427,13 @@ class VulnerabilityDB:
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
+        payload["withdrawal"] = self._withdrawal_payload(report_id)
         return payload
 
     def set_status(self, report_id: int, new_status: str, user_id: int, note: str = "") -> None:
         if not self.can_view(report_id, user_id):
             raise DomainError("无权修改该报告")
+        self._ensure_not_frozen(report_id)
         report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         user = self._user(user_id)
         if user["role"] == "reporter" and new_status != "rejected":
@@ -334,6 +458,7 @@ class VulnerabilityDB:
             raise DomainError("只有该报告的维护者可以提交修复计划")
         if user["role"] == "maintainer" and not self.can_view(report_id, maintainer_id):
             raise DomainError("无权修改该报告")
+        self._ensure_not_frozen(report_id)
         if not plan.strip():
             raise DomainError("修复计划不能为空")
         if target_date:
@@ -362,6 +487,7 @@ class VulnerabilityDB:
         report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         if not report or actor["role"] != "coordinator":
             raise DomainError("只有协调员可以延期")
+        self._ensure_not_frozen(report_id)
         try:
             new_date = datetime.strptime(new_deadline, "%Y-%m-%d").date()
             old_date = datetime.strptime(report["confidential_until"], "%Y-%m-%d").date()
@@ -386,6 +512,7 @@ class VulnerabilityDB:
     def create_advisory_draft(self, report_id: int, content: str, user_id: int) -> int:
         if not self.can_view(report_id, user_id):
             raise DomainError("无权创建公告")
+        self._ensure_not_frozen(report_id)
         user = self._user(user_id)
         if user["role"] not in {"coordinator", "maintainer"}:
             raise DomainError("只有协调员或维护者可以创建公告草稿")
@@ -426,6 +553,7 @@ class VulnerabilityDB:
         report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         if not report or actor["role"] != "coordinator":
             raise DomainError("只有协调员可以披露报告")
+        self._ensure_not_frozen(report_id)
         when = as_of or datetime.now().date().isoformat()
         try:
             now_date = datetime.strptime(when, "%Y-%m-%d").date()
@@ -442,8 +570,9 @@ class VulnerabilityDB:
         report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
         if not report:
             raise DomainError("报告不存在")
-        if report["status"] != "published" and not self.can_view(report_id, user_id):
-            raise DomainError("公告尚未公开")
+        if report["status"] != "published":
+            if not self.can_view(report_id, user_id):
+                raise DomainError("无权查看该公告")
         draft = self.conn.execute("SELECT * FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
         if not draft:
             raise DomainError("公告尚未生成")

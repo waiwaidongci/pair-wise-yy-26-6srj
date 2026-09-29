@@ -34,6 +34,8 @@ class Handler(BaseHTTPRequestHandler):
                 uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_advisory(int(parts[2]),uid))
             if parsed.path=="/api/duplicates":
                 q=parse_qs(parsed.query); return self._json(200,{"duplicates":self.db.find_duplicate_reports(int(q.get("product_id",[0])[0]),q.get("version",[""])[0])})
+            if parsed.path=="/api/withdrawals":
+                uid=int(parse_qs(parsed.query).get("coordinator_id",[0])[0]); return self._json(200,{"withdrawals":self.db.pending_withdrawals(uid)})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
     def do_POST(self):
@@ -50,6 +52,11 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/advisories": return self._json(201,{"ok":True,"id":self.db.create_advisory_draft(int(b.get("report_id",0)),str(b.get("content","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="status": self.db.set_status(int(parts[2]),str(b.get("status","")),int(b.get("user_id",0)),str(b.get("note",""))); return self._json(200,{"ok":True})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="publish": self.db.publish_report(int(parts[2]),int(b.get("coordinator_id",0)),b.get("as_of")); return self._json(200,{"ok":True})
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="withdrawal":
+                return self._json(201,{"ok":True,"id":self.db.request_withdrawal(int(parts[2]),int(b.get("reporter_id",0)),str(b.get("reason","")))})
+            if len(parts)==4 and parts[:2]==["api","withdrawals"] and parts[3]=="review":
+                decision="approved" if str(b.get("decision","")) in ("approved","approve","同意") else "rejected" if str(b.get("decision","")) in ("rejected","reject","驳回") else str(b.get("decision",""))
+                result=self.db.review_withdrawal(int(parts[2]),int(b.get("coordinator_id",0)),decision,str(b.get("note",""))); return self._json(200,{"ok":True,**result})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 
